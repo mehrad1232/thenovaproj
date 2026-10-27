@@ -1,0 +1,34 @@
+name: Build NOVA iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "NOVA_iOS12_Swift_Project.zip"
+      - ".github/workflows/build.yml"
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check ZIP file
+        run: |
+          test -f NOVA_iOS12_Swift_Project.zip
+          unzip -t NOVA_iOS12_Swift_Project.zip
+
+      - name: Extract project
+        run: |
+          mkdir -p project
+          unzip -q NOVA_iOS12_Swift_Project.zip -d project
+          find project -maxdepth 3 -type f | head -100
+
+      - name: Find Xcode project
+        run: |
+          find project -name "*.xcodeproj" -o -name "*.xcworkspace"
+
+      - name: Show Xcode version
+        run: xcodebuild -version
