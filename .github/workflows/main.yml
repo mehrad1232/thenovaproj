@@ -5,7 +5,10 @@ on:
   push:
     paths:
       - "NOVA_iOS12_Swift_Project.zip"
-      - ".github/workflows/build.yml"
+      - ".github/workflows/main.yml"
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -15,20 +18,126 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Check ZIP file
+      - name: Check and extract ZIP
         run: |
+          set -e
           test -f NOVA_iOS12_Swift_Project.zip
           unzip -t NOVA_iOS12_Swift_Project.zip
-
-      - name: Extract project
-        run: |
           mkdir -p project
           unzip -q NOVA_iOS12_Swift_Project.zip -d project
-          find project -maxdepth 3 -type f | head -100
 
-      - name: Find Xcode project
+      - name: Locate Xcode project
+        id: locate
         run: |
-          find project -name "*.xcodeproj" -o -name "*.xcworkspace"
+          set -e
 
-      - name: Show Xcode version
-        run: xcodebuild -version
+          WORKSPACE=$(find project -type d \
+            -name "*.xcworkspace" \
+            -print -quit)
+
+          PROJECT=$(find project -type d \
+            -name "*.xcodeproj" \
+            -print -quit)
+
+          if [ -n "$WORKSPACE" ]; then
+            echo "kind=workspace" >> "$GITHUB_OUTPUT"
+            echo "path=$WORKSPACE" >> "$GITHUB_OUTPUT"
+            xcodebuild -list -json -workspace "$WORKSPACE" \
+              > schemes.json
+          elif [ -n "$PROJECT" ]; then
+            echo "kind=project" >> "$GITHUB_OUTPUT"
+            echo "path=$PROJECT" >> "$GITHUB_OUTPUT"
+            xcodebuild -list -json -project "$PROJECT" \
+              > schemes.json
+          else
+            echo "No Xcode workspace or project found."
+            find project -maxdepth 4 -type f | head -200
+            exit 1
+          fi
+
+      - name: Select build scheme
+        id: scheme
+        run: |
+          python3 - <<'PY'
+          import json, os
+
+          with open("schemes.json") as f:
+              data = json.load(f)
+
+          section = data.get("workspace", data.get("project", {}))
+          schemes = section.get("schemes", [])
+
+          if not schemes:
+              raise SystemExit(
+                  "No shared Xcode schemes found. "
+                  "The project may need a shared scheme."
+              )
+
+          preferred = next(
+              (s for s in schemes if "NOVA" in s.lower()),
+              schemes[0]
+          )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"scheme={preferred}\n")
+
+          print("Selected scheme:", preferred)
+          PY
+
+      - name: Archive iOS app
+        run: |
+          set -o pipefail
+
+          if [ "${{ steps.locate.outputs.kind }}" = "workspace" ]; then
+            TARGET_ARGS=(-workspace "${{ steps.locate.outputs.path }}")
+          else
+            TARGET_ARGS=(-project "${{ steps.locate.outputs.path }}")
+          fi
+
+          xcodebuild \
+            "${TARGET_ARGS[@]}" \
+            -scheme "${{ steps.scheme.outputs.scheme }}" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/NOVA.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            archive 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Package unsigned IPA
+        run: |
+          set -e
+
+          APP=$(find "$RUNNER_TEMP/NOVA.xcarchive/Products/Applications" \
+            -maxdepth 1 -name "*.app" -print -quit)
+
+          if [ -z "$APP" ]; then
+            echo "No app bundle found in archive."
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/ipa/Payload/"
+          cd "$RUNNER_TEMP/ipa"
+
+          /usr/bin/zip -qry \
+            "$GITHUB_WORKSPACE/NOVA-unsigned.ipa" Payload
+
+          test -s "$GITHUB_WORKSPACE/NOVA-unsigned.ipa"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NOVA-unsigned-IPA
+          path: NOVA-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NOVA-build-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 7
