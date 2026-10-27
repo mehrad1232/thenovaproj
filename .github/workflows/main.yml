@@ -1,3 +1,4 @@
+
 name: Build NOVA iOS IPA
 
 on:
@@ -18,112 +19,213 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Check and extract ZIP
+      - name: Show build environment
         run: |
-          set -e
-          test -f NOVA_iOS12_Swift_Project.zip
-          unzip -t NOVA_iOS12_Swift_Project.zip
-          mkdir -p project
-          unzip -q NOVA_iOS12_Swift_Project.zip -d project
+          set -eu
+          xcodebuild -version
+          echo "Repository: $GITHUB_WORKSPACE"
+          echo "Files at repository root:"
+          ls -la
 
-      - name: Locate Xcode project
+      - name: Extract ZIP and locate project
         id: locate
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          WORKSPACE=$(find project -type d \
-            -name "*.xcworkspace" \
-            -print -quit)
+          SRC="$RUNNER_TEMP/nova-source"
+          mkdir -p "$SRC"
 
-          PROJECT=$(find project -type d \
-            -name "*.xcodeproj" \
-            -print -quit)
+          ZIP_FILE="$(find "$GITHUB_WORKSPACE" \
+            -maxdepth 2 -type f \
+            -name 'NOVA_iOS12_Swift_Project.zip' \
+            -print -quit)"
+
+          if [ -n "$ZIP_FILE" ]; then
+            echo "Extracting: $ZIP_FILE"
+            unzip -t "$ZIP_FILE"
+            unzip -q "$ZIP_FILE" -d "$SRC"
+          else
+            echo "ZIP not found; searching checked-out files."
+            cp -R "$GITHUB_WORKSPACE/." "$SRC/"
+          fi
+
+          echo "Extracted file listing:"
+          find "$SRC" -maxdepth 5 -type f | head -200
+
+          PROJECT="$(find "$SRC" -type d \
+            -name 'NOVACalculator.xcodeproj' \
+            -print -quit)"
+
+          WORKSPACE="$(find "$SRC" -type d \
+            -name '*.xcworkspace' \
+            -print -quit)"
 
           if [ -n "$WORKSPACE" ]; then
-            echo "kind=workspace" >> "$GITHUB_OUTPUT"
-            echo "path=$WORKSPACE" >> "$GITHUB_OUTPUT"
-            xcodebuild -list -json -workspace "$WORKSPACE" \
-              > schemes.json
+            KIND="workspace"
+            TARGET="$WORKSPACE"
           elif [ -n "$PROJECT" ]; then
-            echo "kind=project" >> "$GITHUB_OUTPUT"
-            echo "path=$PROJECT" >> "$GITHUB_OUTPUT"
-            xcodebuild -list -json -project "$PROJECT" \
-              > schemes.json
+            KIND="project"
+            TARGET="$PROJECT"
           else
-            echo "No Xcode workspace or project found."
-            find project -maxdepth 4 -type f | head -200
+            echo "::error::No Xcode project or workspace found."
             exit 1
           fi
 
-      - name: Select build scheme
-        id: scheme
+          echo "kind=$KIND" >> "$GITHUB_OUTPUT"
+          echo "path=$TARGET" >> "$GITHUB_OUTPUT"
+
+          echo "Found $KIND:"
+          echo "$TARGET"
+
+      - name: Repair project configuration references
+        shell: bash
         run: |
-          python3 - <<'PY'
-          import json, os
+          set -euo pipefail
 
-          with open("schemes.json") as f:
-              data = json.load(f)
+          PROJECT_DIR="$(dirname "${{ steps.locate.outputs.path }}")"
+          PBXPROJ="${{ steps.locate.outputs.path }}/project.pbxproj"
 
-          section = data.get("workspace", data.get("project", {}))
+          if [ "${{ steps.locate.outputs.kind }}" != "project" ]; then
+            echo "Workspace detected; skipping project.pbxproj repair."
+            exit 0
+          fi
+
+          if [ ! -f "$PBXPROJ" ]; then
+            echo "::error::project.pbxproj is missing."
+            exit 1
+          fi
+
+          cp "$PBXPROJ" "$RUNNER_TEMP/project.pbxproj.original"
+
+          python3 - "$PBXPROJ" <<'PY'
+          import pathlib, re, sys
+
+          p = pathlib.Path(sys.argv[1])
+          text = p.read_text(encoding="utf-8-sig")
+
+          fixes = {
+              "F10000000000000000000001":
+                  "F30000000000000000000001",
+              "F10000000000000000000002":
+                  "F30000000000000000000002",
+          }
+
+          for old, new in fixes.items():
+              text = re.sub(
+                  r"(buildConfigurationList\s*=\s*)" + old + r"\b",
+                  lambda m: m.group(1) + new,
+                  text
+              )
+
+          p.write_text(text, encoding="utf-8")
+          print("Configuration-reference repair pass completed.")
+          PY
+
+          echo "Project file:"
+          sed -n '1,220p' "$PBXPROJ"
+
+          plutil -lint "$PBXPROJ"
+
+      - name: Detect scheme
+        id: scheme
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET="${{ steps.locate.outputs.path }}"
+
+          if [ "${{ steps.locate.outputs.kind }}" = "workspace" ]; then
+            xcodebuild -list -json -workspace "$TARGET" \
+              > "$RUNNER_TEMP/xcode-list.json"
+          else
+            xcodebuild -list -json -project "$TARGET" \
+              > "$RUNNER_TEMP/xcode-list.json"
+          fi
+
+          python3 - "$RUNNER_TEMP/xcode-list.json" \
+            "${{ steps.locate.outputs.kind }}" \
+            "${{ steps.locate.outputs.path }}" <<'PY'
+          import json, pathlib, sys
+
+          data = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          kind = sys.argv[2]
+          path = pathlib.Path(sys.argv[3])
+
+          section = data.get(kind, {})
           schemes = section.get("schemes", [])
 
           if not schemes:
-              raise SystemExit(
-                  "No shared Xcode schemes found. "
-                  "The project may need a shared scheme."
-              )
+              raise SystemExit("No Xcode schemes found.")
 
           preferred = next(
-              (s for s in schemes if "NOVA" in s.lower()),
+              (s for s in schemes if s.lower() == "novacalculator"),
               schemes[0]
           )
 
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"scheme={preferred}\n")
+          with open(pathlib.Path.cwd() / "scheme.txt", "w") as f:
+              f.write(preferred)
 
+          print("Available schemes:", schemes)
           print("Selected scheme:", preferred)
           PY
 
-      - name: Archive iOS app
+          echo "scheme=$(cat scheme.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Build unsigned iOS app
+        shell: bash
         run: |
           set -o pipefail
 
-          if [ "${{ steps.locate.outputs.kind }}" = "workspace" ]; then
-            TARGET_ARGS=(-workspace "${{ steps.locate.outputs.path }}")
+          TARGET="${{ steps.locate.outputs.path }}"
+          SCHEME="${{ steps.scheme.outputs.scheme }}"
+          KIND="${{ steps.locate.outputs.kind }}"
+
+          if [ "$KIND" = "workspace" ]; then
+            xcodebuild \
+              -workspace "$TARGET" \
+              -scheme "$SCHEME" \
+              -configuration Release \
+              -sdk iphoneos \
+              -destination 'generic/platform=iOS' \
+              -derivedDataPath "$RUNNER_TEMP/NOVA-DerivedData" \
+              CODE_SIGNING_ALLOWED=NO \
+              build 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log"
           else
-            TARGET_ARGS=(-project "${{ steps.locate.outputs.path }}")
+            xcodebuild \
+              -project "$TARGET" \
+              -scheme "$SCHEME" \
+              -configuration Release \
+              -sdk iphoneos \
+              -destination 'generic/platform=iOS' \
+              -derivedDataPath "$RUNNER_TEMP/NOVA-DerivedData" \
+              CODE_SIGNING_ALLOWED=NO \
+              build 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log"
           fi
 
-          xcodebuild \
-            "${TARGET_ARGS[@]}" \
-            -scheme "${{ steps.scheme.outputs.scheme }}" \
-            -configuration Release \
-            -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
-            -archivePath "$RUNNER_TEMP/NOVA.xcarchive" \
-            CODE_SIGNING_ALLOWED=NO \
-            archive 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log"
-
       - name: Package unsigned IPA
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          APP=$(find "$RUNNER_TEMP/NOVA.xcarchive/Products/Applications" \
-            -maxdepth 1 -name "*.app" -print -quit)
+          APP_PATH="$RUNNER_TEMP/NOVA-DerivedData/Build/Products/Release-iphoneos/NOVACalculator.app"
 
-          if [ -z "$APP" ]; then
-            echo "No app bundle found in archive."
+          if [ ! -d "$APP_PATH" ]; then
+            echo "::error::Built NOVACalculator.app not found."
+            find "$RUNNER_TEMP/NOVA-DerivedData/Build/Products" \
+              -maxdepth 4 -print || true
             exit 1
           fi
 
           mkdir -p "$RUNNER_TEMP/ipa/Payload"
-          cp -R "$APP" "$RUNNER_TEMP/ipa/Payload/"
+          cp -R "$APP_PATH" "$RUNNER_TEMP/ipa/Payload/"
           cd "$RUNNER_TEMP/ipa"
 
           /usr/bin/zip -qry \
             "$GITHUB_WORKSPACE/NOVA-unsigned.ipa" Payload
 
           test -s "$GITHUB_WORKSPACE/NOVA-unsigned.ipa"
+          echo "IPA created successfully."
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
@@ -133,11 +235,14 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Upload build log on failure
+      - name: Upload diagnostic logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: NOVA-build-log
-          path: ${{ runner.temp }}/xcodebuild.log
+          name: NOVA-build-diagnostics
+          path: |
+            ${{ runner.temp }}/xcodebuild.log
+            ${{ runner.temp }}/xcode-list.json
+            ${{ runner.temp }}/project.pbxproj.original
           if-no-files-found: ignore
           retention-days: 7
